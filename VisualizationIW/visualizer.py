@@ -1,31 +1,25 @@
-from os import stat
 import pyglet
 import numpy as np
 import cv2
+import threading
+import datetime
+import time
 
 
 ### CONSTANTS
 
-fn_res = 100 # Takes 100 by 100 samples
+fn_res = 200 # Takes 200 by 200 samples
 spline_res = 300 # Draws onto 300 by 300 image before upscaling
-mode_automatic = False # Currently a constant - not sure if this functionality will go within-class
+mode_automatic = False # Currently a constant - not sure if this functionality will go within-clas4
 
-#Random color palette I generated - there will be more options
+#Random color palette I generated 
 colors_rgba = np.array([
     [0,0,0,0],
-    [138,163,153,255],
-    [125,132,178,255],
-    [143,166,203,255],
-    [219,244,167,255],
+    [138,163,153,255], #pos fill
+    [125,132,178,255], #level set color
+    [143,166,203,255], #neg fill
+    [219,244,167,255], #spline
     [213,249,222,255]    
-    ],dtype=np.uint8)
-colors_rgb = np.array([
-    [0,0,0],
-    [138,163,153],
-    [125,132,178],
-    [143,166,203],
-    [219,244,167],
-    [213,249,222]    
     ],dtype=np.uint8)
 
 ### CANVAS AND COORDINATES
@@ -59,7 +53,7 @@ def set_state_and_key(mode_auto:bool, state_dict:dict[str,float]):
     global state
     mode_automatic = mode_auto
     state=state_dict
-    for i in state_dict:
+    for i in state_dict.keys():
         state_valid[i] = False
 
 def print_state():
@@ -88,6 +82,7 @@ window.maximize()
 
 @window.event
 def on_draw():
+    #print(str(datetime.datetime.now().microsecond), "draw")
     do_updates()
     window.clear()
     batch.draw()
@@ -98,7 +93,7 @@ def on_resize(width, height):
     global window_height
     window_width = width
     window_height = height
-    print(f'The window was resized to {width},{height}')
+    #print(f'The window was resized to {width},{height}')
     for fn_sprite in [* render_functions, *render_splines]:
         s = fn_sprite.pyg_sprite
         s.update(scale_x = window_width / s.image.width, scale_y = window_height / s.image.height)
@@ -109,6 +104,9 @@ def update_state(new_state:dict[str, float]):
     for updated_item in new_state.keys():
         state[updated_item] = new_state[updated_item]
         state_valid[updated_item] = False
+    for item in [*render_functions, *render_splines]:
+        #print("trying to start update thread on",item.nickname)
+        item.start_update_thread(override_state = new_state)
 
 def do_updates():
     #call from inside app thread - can call sprites and render changes
@@ -117,8 +115,11 @@ def do_updates():
         if state_valid[i] == False:
             state_changes[i]=state[i]
             state_valid[i] = True
-    for item in [*render_objects, *render_functions, *render_splines]:
+    for item in render_objects:
         item.do_update(state_changes)
+
+    for item in [*render_functions, *render_splines]:
+        item.check_new_img_avail()
 
 def run_app():
     pyglet.app.run()
@@ -155,6 +156,8 @@ class RenderObject():
         if listeners==None or len(listeners.keys())==0:
             self.static = True
 
+        init_x, init_y = coords2px(init_x, init_y)
+
         img = pyglet.image.load(filename_or_shape)
         self.pyg_sprite = pyglet.sprite.Sprite(img, batch=batch, group=objects_group, x=init_x, y=init_y)
         self.pyg_sprite.update(scale_x=init_scale_x, scale_y=init_scale_y, rotation=init_theta_deg)
@@ -171,7 +174,7 @@ class RenderObject():
                     assert(link in self.props.keys())
 
     def do_update(self, new_state_values:dict[str, float]):
-        #print("Render Object Update Loop:",self.nickname)
+        ##print("Render Object Update Loop:",self.nickname)
         if self.static: return
 
         #new_state_values example: {"drone_x":32, "drone_y":79}
@@ -208,44 +211,88 @@ class RenderSpline():
 
         self.width = int(width / client_canvas_width * spline_res) # standardize inputs
 
-        init_img = self.resample_image()
+        func_args = [[state[i] for i in spline_part[3]] for spline_part in self.spline_parts]
+        init_img = self.resample_image(func_args)
+
         img = pyglet.image.ImageData(spline_res, spline_res, "RGBA", init_img.flatten().tobytes())
         self.pyg_sprite = pyglet.sprite.Sprite(img, batch=batch, group=splines_group)   
 
-    def do_update(self, new_state_values:dict[str, float]):
-        #print("Render Spline Update Loop:",self.nickname)
+        self.thread = threading.Thread(target=self.thread_target)
+        self.thread_override_state = {}
+        self.thread_resample_flag = False
+        self.new_img_avail = False
+        self.new_img = None
+        self.thread.start()
+
+    def start_update_thread(self, override_state:dict[str,float]):
+        #run from outside thread
         if self.static: return
+        if self.new_img_avail: return
 
         #do we need to resample?
         #new_state_values example: {"drone_x":32, "drone_y":79}
-        updates_to_make = [i for i in new_state_values.keys() if i in self.listeners]
+        updates_to_make = [i for i in override_state.keys() if i in self.listeners]
         if len(updates_to_make)==0: return
 
-        #resample
-        img = self.resample_image()
-        #update sprite
-        self.pyg_sprite.image = pyglet.image.ImageData(spline_res, spline_res, "RGBA", img.flatten().tobytes() )
+        self.thread_override_state = override_state
+        self.thread_resample_flag = True
 
-    def resample(self):
-        print("Render Spline Resample Loop:",self.nickname)
+        
+    def thread_target(self):
+        while(True):
+            if(self.thread_resample_flag):
+                self.thread_resample_flag = False
+                func_args = []
+                for spline_part in self.spline_parts:
+                    #compute required arguments for each spline part function
+                    sig = spline_part[3]
+                    func_args_part = []
+                    for i in sig:
+                        if i in self.thread_override_state.keys():
+                            func_args_part.append(self.thread_override_state[i])
+                        else:
+                            func_args_part.append(state[i])
+                    func_args.append(func_args_part)
+
+                #resample
+                img = self.resample_image(func_args)
+                #update sprite
+                self.new_img = pyglet.image.ImageData(spline_res, spline_res, "RGBA", img.flatten().tobytes() )
+                self.new_img_avail = True
+                #print(str(datetime.datetime.now().microsecond), "SPLINE target end")
+            else:
+                time.sleep(0.2)
+
+    def check_new_img_avail(self):
+        #print(str(datetime.datetime.now().microsecond), "SPLINE check img")
+        if self.static or not self.new_img_avail: return
+        #print(str(datetime.datetime.now().microsecond), "SPLINE start update img")
+        self.pyg_sprite.image = self.new_img
+        self.new_img = None
+        self.new_img_avail = False
+        #print(str(datetime.datetime.now().microsecond), "SPLINE IMG updated")
+
+    def resample(self, func_args:list[list[float]]):
+        #print(str(datetime.datetime.now().microsecond), "Render Spline Resample Loop:",self.nickname)
         points_x=[]
         points_y=[]
-        ds=2
+        ds=1
         #self.segment_functions = spline_parts[:,0]
         #self.range_begin = spline_parts[:,1]
         #self.range_end = spline_parts[:,2]
         #self.function_args = spline_parts[:,3,:]
-        for p in self.spline_parts:
+        for i in range(len(self.spline_parts)):
+            p = self.spline_parts[i]
             for s in np.arange(p[1], p[2], ds):
-                x,y = p[0](s, *[state[i] for i in p[3]])
+                x,y = p[0](s, *(func_args[i]))
                 points_x.append(x)
                 points_y.append(y)
 
         #take samples with signature args - end up with a list of points
         return points_x, points_y
 
-    def resample_image(self):
-        points_x, points_y = self.resample()
+    def resample_image(self, func_args):
+        points_x, points_y = self.resample(func_args)
         #points are now in coords-space
         #want to map them evenly onto spline resolution-size space (pixels)
         for i in range(len(points_x)):
@@ -254,7 +301,7 @@ class RenderSpline():
         img = np.zeros((spline_res, spline_res, 4), dtype=np.uint8)
 
         for i in range(0, len(points_x)-1):
-            cv2.line(img, (points_x[i], points_y[i]), (points_x[i+1],points_y[i+1]), color=(255,255,255,255), thickness=self.width)
+            cv2.line(img, (points_x[i], points_y[i]), (points_x[i+1],points_y[i+1]), color=(int(colors_rgba[4][0]), int(colors_rgba[4][1]), int(colors_rgba[4][2]), 255), thickness=self.width)
 
         return img
 
@@ -276,31 +323,72 @@ class RenderFunction():
         self.fill_neg = fill_neg
         self.level_sets = level_sets
 
-        init_samples = self.resample()
+        init_samples = self.resample([state[i] for i in self.signature])
         flat = np.ndarray.flatten(init_samples)
         init_img = pyglet.image.ImageData(fn_res, fn_res, "RGBA", flat.tobytes())
         
         self.pyg_sprite = pyglet.sprite.Sprite(init_img, batch=batch, group=functions_group)
         #Scaling fits to window on resize
 
-    def do_update(self, new_state_values:dict[str, float]):
-        #print("Render Function Update Loop:",self.nickname)
+        self.thread = threading.Thread(target=self.thread_target)
+        self.thread_state_override = {}
+        self.thread_resample_flag = False
+        self.new_img_avail = False
+        self.new_img = None
+        self.thread.start()
+    
+    def start_update_thread(self, override_state:dict[str,float]):
+        #run from outside thread
+        #print("tried to start update thread")
+
         if self.static: return
+        if self.new_img_avail: return
 
         #do we need to resample?
         #new_state_values example: {"drone_x":32, "drone_y":79}
-        updates_to_make = [i for i in new_state_values.keys() if i in self.signature]
+        updates_to_make = [i for i in override_state.keys() if i in self.signature]
         if len(updates_to_make)==0: return
 
-        #resample
-        samples = self.resample()
+        self.thread_state_override = override_state
+        self.thread_resample_flag = True
 
-        #update sprite
-        self.pyg_sprite.image = pyglet.image.ImageData(fn_res, fn_res, "RGBA", samples.flatten().tobytes() )
+        
+    def thread_target(self):
+        while(True):
+            if(self.thread_resample_flag):
+                self.thread_resample_flag = False
+                func_args = []
+                for i in range(len(self.signature)):
+                    s = self.signature[i]
+                    if s in self.thread_state_override.keys():
+                        func_args.append(self.thread_state_override[s])
+                    else:
+                        func_args.append(state[s])
+                #resample
+                img = self.resample(func_args)
+                #update sprite
+                self.new_img = pyglet.image.ImageData(fn_res, fn_res, "RGBA", img.flatten().tobytes() )
+                self.new_img_avail = True
+                #print(str(datetime.datetime.now().microsecond), "FUNCTION target end")
+            else:
+                time.sleep(0.3)
+        
+
+    def check_new_img_avail(self):
+        #print(str(datetime.datetime.now().microsecond), "FUNCTION check img")
+        #print("new image is available: ",self.new_img_avail)
+        if self.static or not self.new_img_avail: return
+        #print(str(datetime.datetime.now().microsecond), "FUNCTION start update img")
+        self.pyg_sprite.image = self.new_img
+        self.new_img = None
+        #print("unset img")
+        self.new_img_avail = False
+        #print(str(datetime.datetime.now().microsecond), "FUNCTION IMG updated")
 
 
-    def resample(self):
-        print("Render Function Resample Loop:",self.nickname)
+
+    def resample(self, func_args):
+        #print("Render Function Resample Loop:",self.nickname)
         #say sample is image size?
         samples = np.zeros((fn_res,fn_res,4),dtype=np.uint8)
 
@@ -308,8 +396,7 @@ class RenderFunction():
         for i in range(fn_res):
             for j in range(fn_res):
                 #call f(x, y, other arguments...) and save into samples array
-                extra_args = [state[i] for i in self.signature]
-                sample=self.func(*px2coords(i*window_width/fn_res, j*window_height/fn_res) , * extra_args)
+                sample=self.func(*px2coords(i*window_width/fn_res, j*window_height/fn_res) , * func_args)
 
                 #Decide tag - 0=transparent 1=fill_pos 2=level set 3=fill_neg
                 tag = 0

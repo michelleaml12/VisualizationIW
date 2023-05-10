@@ -11,7 +11,7 @@
     <OutputPath>.</OutputPath>
     <Name>VisualizationIW</Name>
     <RootNamespace>VisualizationIW</RootNamespace>
-    <InterpreterId>Global|PythonCore|3.11</InterpreterId>
+    <InterpreterId>Global|PythonCore|3.9</InterpreterId>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
