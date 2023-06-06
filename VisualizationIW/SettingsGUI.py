@@ -289,7 +289,7 @@ class SettingsGUI:
                 self.slider.pack(side="right", padx=10)
 
             def val_command(self, val):
-                print("val cmd", val, self.nickname)
+                #print("val cmd", val, self.nickname)
                 self.visualizer.update_state_manual({self.nickname: float(int(val))})
 
                 # this sets the initial state
